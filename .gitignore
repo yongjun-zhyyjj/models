@@ -1,0 +1,11 @@
+*.swp
+*.swo
+*.prj
+*.log
+__pycache__/
+*.untracked*
+**/vnc_logs
+tags
+dump/
+sandbox/
+*~
