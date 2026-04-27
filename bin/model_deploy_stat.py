@@ -194,11 +194,41 @@ def extract_pef_mapping(node_deploy_dict):
 
     return results, PEF_ids
 
+# resolve_inline_pef: resolve a pef_key from an inline pefs dict; returns (pef_id, ss, batch_sizes) or (None, None, None) on error
+def resolve_inline_pef(pefs, pef_key, seq_size, config, yaml_file):
+    if pef_key not in pefs:
+        print(f"ERROR: {pef_key} is not found in file: {yaml_file}")
+        return None, None, None
+
+    pef_source = re.sub(r'^.*/pefs/', '', pefs[pef_key]['source'])
+    pef_id = pef_source.split('/')[0]
+
+    # find out ss and batch_sizes
+    if seq_size == '':
+        extracted, count = re.subn(r'.*(\d+K)_PEF.*', r'\1', pef_key, flags=re.IGNORECASE)
+        seq_size = extracted if count else '4k'
+    batch_size = config.get('batch_size')
+    if 'dynamic_dims' in config:
+        decode_ssmin = config['dynamic_dims']['decode_seq']['min']
+        decode_ssmax = config['dynamic_dims']['decode_seq']['max']
+        decode_sstep = config['dynamic_dims']['decode_seq']['step']
+        ssmin = round(decode_ssmin / 1024)
+        ssmax = round(decode_ssmax / 1024)
+        sstep = round(decode_sstep / 1024)
+        ss = f'{seq_size}-DYT:{ssmin}k:{ssmax}k:{sstep}k'
+        batch_sizes = config['dynamic_dims']['batch_size']['values'] if 'batch_size' in config['dynamic_dims'] else [batch_size]
+    else:
+        ss = seq_size
+        batch_sizes = [batch_size]
+
+    return pef_id, ss, batch_sizes
+
 def read_bundle_depoly_yaml(yaml_file, yaml_doc, results, PEF_ids):
     #valid_models = r'^(Meta-Llama|Llama|DeepSeek|Whisper|GPT|Qwen|E5-Mistral|allam)'
     valid_models = r'.*'
     ignore_names = r'-Ricoh-|-Guard-|-Draft|SCX-Magpie-120b|UD_Humanizer_V(12.4|13|13.1)'
-    prodtype, YAML = re.findall(r'([^/]+)/([^/]+).yaml', yaml_file)[0] if re.search(r'/', yaml_file) else ['.', re.sub(r'\.yaml$', '', yaml_file)]
+    _pt, YAML = re.findall(r'([^/]+)/([^/]+).yaml', yaml_file)[0] if re.search(r'/', yaml_file) else ['.', re.sub(r'\.yaml$', '', yaml_file)]
+    prodtype = f"bundles/{_pt}"
 
     # Extract models/experts section
     models = yaml_doc.get('spec', {}).get('models', {})
@@ -210,37 +240,16 @@ def read_bundle_depoly_yaml(yaml_file, yaml_doc, results, PEF_ids):
 
         experts = models[model_id]['experts']
         for seq_size in experts:
-            ss = seq_size   ;#ss = "4k" if seq_size == "default" else seq_size
             served_bs = defaultdict(list)
 
             for config in experts[seq_size]['configs']:
                 pef_key = config['pef']
-                if pef_key not in pefs:
-                    print(f"ERROR: {pef_key} is not found in file: {yaml_file}")
+
+                # Extract just the 'PEF_id' from the full path; record the batch_sizes being served by this pef_id
+                pef_id, ss, batch_sizes = resolve_inline_pef(pefs, pef_key, seq_size, config, yaml_file)
+                if pef_id is None:
                     continue
-
-                # Extract just the 'PEF_id' from the full path
-                pef_source = pefs[pef_key]['source']
-                pef_source = re.sub(r'^.*/pefs/', '', pef_source)
-                pef_id = pef_source.split('/')[0]
                 PEF_ids[pef_id][model_id] = 1
-
-                # record the batch_sizes being served by this pef_id
-                batch_size = config.get('batch_size')
-                if 'dynamic_dims' in config:
-                    decode_ssmin = config['dynamic_dims']['decode_seq']['min']
-                    decode_ssmax = config['dynamic_dims']['decode_seq']['max']
-                    decode_sstep = config['dynamic_dims']['decode_seq']['step']
-                    ssmin = round(decode_ssmin / 1024)
-                    ssmax = round(decode_ssmax / 1024)
-                    sstep = round(decode_sstep / 1024)
-                    ss = f'DYT-{ssmin}k:{ssmax}k:{sstep}k'
-                    if 'batch_size' in config['dynamic_dims']:
-                        batch_sizes = config['dynamic_dims']['batch_size']['values']
-                    else:
-                        batch_sizes = [batch_size]
-                else:
-                    batch_sizes = [batch_size]
 
                 for bs in batch_sizes:
                     served_bs[pef_id].append(bs)
@@ -253,7 +262,8 @@ def read_inference_depoly_yaml(yaml_file, yaml_doc, results, PEF_ids):
     #valid_models = r'^(Meta-Llama|Llama|DeepSeek|Whisper|GPT|Qwen|E5-Mistral|allam)'
     valid_models = r'.*'
     ignore_names = r'-Ricoh-|-Guard-|-Draft|SCX-Magpie-120b|UD_Humanizer_V(12.4|13|13.1)'
-    prodtype, YAML = re.findall(r'([^/]+)/([^/]+).yaml', yaml_file)[0] if re.search(r'/', yaml_file) else ['.', re.sub(r'\.yaml$', '', yaml_file)]
+    _pt, YAML = re.findall(r'([^/]+)/([^/]+).yaml', yaml_file)[0] if re.search(r'/', yaml_file) else ['.', re.sub(r'\.yaml$', '', yaml_file)]
+    prodtype = f"inference-deployments/{_pt}"
 
     # Extract models/experts section
     models = yaml_doc.get('spec', {}).get('experts', {})
@@ -263,56 +273,31 @@ def read_inference_depoly_yaml(yaml_file, yaml_doc, results, PEF_ids):
         if not args.all_models_in_yaml and not re.search(f'{valid_models}', model_string, re.IGNORECASE): continue
         if not args.all_models_in_yaml and re.search(f'{ignore_names}', model_string): continue
 
-        for dummy_loop in [1]:
-            model_id, seq_size = re.findall(r'^(.*?)-?(\d+[kK])?$', model_string)[0]
-            ss = f"{seq_size}"
-            served_bs = defaultdict(list)
+        model_id, seq_size = re.findall(r'^(.*?)-?(\d+[kK])?$', model_string)[0]
+        served_bs = defaultdict(list)
 
-            for config in models[model_string]:
-                pef_key = config['pef']
-                if pef_key not in pefs:
-                    print(f"ERROR: {pef_key} is not found in file: {yaml_file}")
-                    continue
-                if ss == '':
-                    seq_size, count = re.subn(r'.*(\d+K)_PEF.*', r'\1', pef_key, flags=re.IGNORECASE)
-                    ss = f"{seq_size}" if count else f"4k"
+        for config in models[model_string]:
+            pef_key = config['pef']
 
-                # Extract just the 'PEF_id' from the full path
-                pef_source = pefs[pef_key]['source']
-                pef_source = re.sub(r'^.*/pefs/', '', pef_source)
-                pef_id = pef_source.split('/')[0]
-                PEF_ids[pef_id][model_id] = 1
+            # Extract just the 'PEF_id' from the full path; record the batch_sizes being served by this pef_id
+            pef_id, ss, batch_sizes = resolve_inline_pef(pefs, pef_key, seq_size, config, yaml_file)
+            if pef_id is None:
+                continue
+            PEF_ids[pef_id][model_id] = 1
 
-                # record the batch_sizes being served by this pef_id
-                batch_size = config.get('batch_size')
-                if 'dynamic_dims' in config:
-                    decode_ssmin = config['dynamic_dims']['decode_seq']['min']
-                    decode_ssmax = config['dynamic_dims']['decode_seq']['max']
-                    decode_sstep = config['dynamic_dims']['decode_seq']['step']
-                    ssmin = round(decode_ssmin / 1024)
-                    ssmax = round(decode_ssmax / 1024)
-                    sstep = round(decode_sstep / 1024)
-                    ss = f'DYT-{ssmin}k:{ssmax}k:{sstep}k'
-                    if 'batch_size' in config['dynamic_dims']:
-                        batch_sizes = config['dynamic_dims']['batch_size']['values']
-                    else:
-                        batch_sizes = [batch_size]
-                else:
-                    batch_sizes = [batch_size]
+            for bs in batch_sizes:
+                served_bs[pef_id].append(bs)
+                results[model_id][ss]['all_batch_sizes'][bs][YAML] = True
 
-                for bs in batch_sizes:
-                    served_bs[pef_id].append(bs)
-                    results[model_id][ss]['all_batch_sizes'][bs][YAML] = True
-
-            results[model_id][ss][YAML] = served_bs
-            results[model_id][ss]['all_yaml_files'][YAML] = prodtype
+        results[model_id][ss][YAML] = served_bs
+        results[model_id][ss]['all_yaml_files'][YAML] = prodtype
 
 # a custom key function for sorted()
 def sort_ss(ss):
     if ss == 'default':
         return 0
-    elif m := re.search(r'^DYT-(\d+)k:(\d+)k:(\d+)k', ss):
-        return 9000 + int(m.group(2))
+    elif m := re.search(r'^(\d+)[kK]-DYT:', ss):
+        return 9000 + int(m.group(1))
     else:
         return int(re.sub(r'^(\d+).*', r'\1', ss))
 
@@ -355,24 +340,24 @@ def print_results_model_offering(results, txtf="CLOUD_snapshot.txt", csv2="CLOUD
             for i in range(max_num_of_lines):
                 # batch_size
                 if i == 0:
-                    SS_string = "default" if context_ss == "default" else f"SS-{context_ss}"
-                    model_rawf1.write(f"    {SS_string:<20}{bs_list[0]:>4}    ")
+                    SS_string = context_ss if context_ss == "default" else f"SS-{context_ss}"
+                    model_rawf1.write(f"    {SS_string:<24}{bs_list[0]:>4}    ")
                 elif i < len(bs_list):
-                    model_rawf1.write(f"{bs_list[i]:>28}    ")
+                    model_rawf1.write(f"{bs_list[i]:>32}    ")
                 else:
-                    model_rawf1.write(f"{' '*32}")
+                    model_rawf1.write(f"{' '*36}")
                 # pef information
                 if i < len(yaml_list):
                     prodtype = results[model_id][context_ss]['all_yaml_files'][yaml_list[i]]
                     yaml_file = f"{prodtype}/{yaml_list[i]}.yaml"
-                    model_rawf1.write(f"{yaml_file:<56} {pef_list[i]}\n")
+                    model_rawf1.write(f"{yaml_file:<72} {pef_list[i]}\n")
                 else:
                     model_rawf1.write("\n")
 
             # print csv lines
             model_id_csv = model_id_str
-            if m := re.search(r'^DYT-(\d+)k:(\d+)k:(\d+)k', context_ss):
-                context_ss_csv1 = f'DYT-{m.group(1)}k(min):{m.group(2)}k(max):{m.group(3)}k(step)'
+            if m := re.search(r'^(\S+)-DYT:(\d+)k:(\d+)k:(\d+)k', context_ss):
+                context_ss_csv1 = f'{m.group(1)}-DYT:{m.group(2)}k(min):{m.group(3)}k(max):{m.group(4)}k(step)'
             else:
                 context_ss_csv1 = context_ss
             context_ss_csv2 = context_ss
