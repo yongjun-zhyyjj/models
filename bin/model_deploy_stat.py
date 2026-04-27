@@ -323,6 +323,7 @@ def print_results_model_offering(results, txtf="CLOUD_snapshot.txt", csv2="CLOUD
             yaml_list = sorted(list(results[model_id][context_ss]['all_yaml_files']))
             pef_list = []
             consolidate = True
+            common_pef_id = None
             for YAML in yaml_list:
                 served_bs = results[model_id][context_ss][YAML]
                 if len(served_bs) > 1 or len(list(served_bs.values())[0]) != len(bs_list):
@@ -330,10 +331,14 @@ def print_results_model_offering(results, txtf="CLOUD_snapshot.txt", csv2="CLOUD
                 out_str = ''
                 for pef_id, bs in served_bs.items():
                     out_str += f"BS-{'-'.join(str(n) for n in bs)}: {pef_id}    "
+                    if common_pef_id is None:
+                        common_pef_id = pef_id
+                    elif pef_id != common_pef_id:
+                        consolidate = False
                 pef_list.append(f"{out_str[:-4]}")
             if consolidate:
                 for i in range(len(pef_list)):
-                    pef_list[i] = pef_id if i == 0 else ""
+                    pef_list[i] = common_pef_id if i == 0 else ""
 
             # print txt format lines foreach context_len/SS
             max_num_of_lines = max(len(bs_list), len(yaml_list))
