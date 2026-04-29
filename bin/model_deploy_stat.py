@@ -20,6 +20,7 @@ and outputs the required information in table format.
     parser.add_argument("-full",action="store_true",help="Generate output files: NODE_deploy_date.by_bundle.*")
     parser.add_argument("-prefix_outfile",action="store",help="output files name will be: <PREFIX>.*", metavar="<PREFIX>")
     parser.add_argument("-bundle", nargs="+", action="extend",help="Specify 1 or more yaml files, support wildcard *, or a single <>.flist, output in bundle_snapshot.txt", metavar="<YAML>", default=[])
+    parser.add_argument("-v2", action="store_true", help="v2(PEF CRs) behavior, first lookup YAML from bundles-v2/ dir, and fallback to bundles/ as needed)")
     return parser.parse_args()
 
 def extract_deployment_names(tfvar_files):
@@ -122,7 +123,8 @@ def read_bundle_deployment_spec(dep_specs, dep_siteid, dep_stat):
         # bundle or inference deploy method
         yaml_name = deploy['name']
         if 'groups' in deploy:
-            dep_stat[yaml_name]['BUNDLE_DIR_PATH'] = os.path.abspath(f"{args.tfvars_dir}/../../../../../../../fast-coe/helm/charts/bundles/bundles")
+            bundles_subdir = "bundles-v2" if args.v2 else "bundles"
+            dep_stat[yaml_name]['BUNDLE_DIR_PATH'] = os.path.abspath(f"{args.tfvars_dir}/../../../../../../../fast-coe/helm/charts/bundles/{bundles_subdir}")
             groups = deploy['groups']
         else:
             dep_stat[yaml_name]['BUNDLE_DIR_PATH'] = os.path.abspath(f"{args.tfvars_dir}/../../../../../../../fast-coe/helm/inference-deployments")
@@ -154,15 +156,18 @@ def extract_pef_mapping(node_deploy_dict):
     nested_defaultdict = lambda: defaultdict(nested_defaultdict)
     results = nested_defaultdict()
     PEF_ids = defaultdict(dict)
-    
+
     for YAML in node_deploy_dict['YAML']:
         min_replica = sum( node_deploy_dict['YAML'][YAML].values() )
         if min_replica == 0: continue
 
-        # figure out which yaml_file to use:
+        # figure out which yaml_file to use: check bundles-v2/ first, fall back to bundles/
         bundle_dir = node_deploy_dict['BUNDLE_DIR_PATH'][YAML]
         yaml_file1 = f"{bundle_dir}/sambastack/{YAML}.yaml"
         yaml_file2 = f"{bundle_dir}/prod/{YAML}.yaml"
+        bundle_dir_v1 = re.sub(r'/bundles-v2$', '/bundles', bundle_dir)
+        yaml_file3 = f"{bundle_dir_v1}/sambastack/{YAML}.yaml"
+        yaml_file4 = f"{bundle_dir_v1}/prod/{YAML}.yaml"
         if os.path.isfile(yaml_file1):
             yaml_file = yaml_file1
             if os.path.isfile(yaml_file2):
@@ -174,10 +179,21 @@ def extract_pef_mapping(node_deploy_dict):
                     print("       : with identical content")
         elif os.path.isfile(yaml_file2):
             yaml_file = yaml_file2
+        elif args.v2 and os.path.isfile(yaml_file3):
+            yaml_file = yaml_file3
+            if os.path.isfile(yaml_file4):
+                print(f"Warning: duplicate file: '{YAML}.yaml' is found at both dirs: {bundle_dir_v1}/{{sambastack,prod}}/")
+                exit_code = subprocess.call(f"diff {yaml_file3} {yaml_file4}", shell=True, stdout=subprocess.DEVNULL)
+                if exit_code:
+                    print("       : with different content")
+                else:
+                    print("       : with identical content")
+        elif args.v2 and os.path.isfile(yaml_file4):
+            yaml_file = yaml_file4
         else:
-            print(f"Warning: File {YAML}.yaml not found at {bundle_dir}/{{sambastack,prod}}/ Skip ...")
+            print(f"Warning: File {YAML}.yaml not found at {bundle_dir}/{{sambastack,prod}}/ or {bundle_dir_v1}/{{sambastack,prod}}/ Skip ...")
             continue
-    
+
         # read_yaml_file and build results dictionary
         try:
             with open(yaml_file, 'r') as f:
@@ -223,17 +239,72 @@ def resolve_inline_pef(pefs, pef_key, seq_size, config, yaml_file):
 
     return pef_id, ss, batch_sizes
 
+# resolve_pef_cr: resolve a PEF CR by name+version; returns (pef_id, ss, batch_sizes) or (None, None, None) on error
+def resolve_pef_cr(pef_dir, pef_key, seq_size, config, yaml_file):
+    # several error handlings
+    if ':' not in pef_key:
+        print(f"ERROR: expected '<cr-name>:<version>' but got '{pef_key}' in file: {yaml_file}")
+        return None, None, None
+    cr_name, cr_version = pef_key.rsplit(':', 1)
+    for subdir in ['sambastack', 'prod']:
+        pef_file = f"{pef_dir}/{subdir}/{cr_name}.yaml"
+        if os.path.isfile(pef_file):
+            with open(pef_file, 'r') as f:
+                pef_cr = yaml.safe_load(f)
+            break
+
+    if not pef_cr:
+        print(f"Warning: PEF CR '{cr_name}' not found in {pef_dir}/{{sambastack,prod}}/")
+        return None, None, None
+    else:
+        versions = pef_cr.get('spec', {}).get('versions', {})
+        if cr_version not in versions:
+            print(f"ERROR: version '{cr_version}' not found in PEF CR '{cr_name}'")
+            return None, None, None
+
+    # continue with normal case....
+    # find out pef_id
+    pef_source = re.sub(r'^.*/pefs/', '', versions[cr_version]['source'])
+    pef_id = pef_source.split('/')[0]
+
+    # find out ss
+    pef_meta = pef_cr.get('spec', {}).get('metadata', {})
+    dyn = pef_meta.get('dynamic_dims', {})
+    if dyn.get('enabled'):
+        decode_ssmin = dyn['decode_seq']['min']
+        decode_ssmax = dyn['decode_seq']['max']
+        decode_sstep = dyn['decode_seq']['step']
+        ssmin = round(decode_ssmin / 1024)
+        ssmax = round(decode_ssmax / 1024)
+        sstep = round(decode_sstep / 1024)
+        ss = f'{seq_size}-DYT:{ssmin}k:{ssmax}k:{sstep}k'
+    else:
+        ss = seq_size
+
+    # find out batch_sizes
+    cfg_bs = config.get('dynamic_dims', {}).get('batch_size', {}).get('values')
+    if cfg_bs:
+        batch_sizes = cfg_bs
+    elif dyn.get('enabled'):
+        batch_sizes = dyn['batch_size']['values'] if 'batch_size' in dyn else [pef_meta['batch_size']]
+    else:
+        batch_sizes = [pef_meta['batch_size']]
+
+    return pef_id, ss, batch_sizes
+
 def read_bundle_depoly_yaml(yaml_file, yaml_doc, results, PEF_ids):
     #valid_models = r'^(Meta-Llama|Llama|DeepSeek|Whisper|GPT|Qwen|E5-Mistral|allam)'
     valid_models = r'.*'
     ignore_names = r'-Ricoh-|-Guard-|-Draft|SCX-Magpie-120b|UD_Humanizer_V(12.4|13|13.1)'
     _pt, YAML = re.findall(r'([^/]+)/([^/]+).yaml', yaml_file)[0] if re.search(r'/', yaml_file) else ['.', re.sub(r'\.yaml$', '', yaml_file)]
-    prodtype = f"bundles/{_pt}"
 
     # Extract models/experts section
+    use_pef_crs = yaml_doc.get('spec', {}).get('usePefCRs', False)
+    pef_dir = os.path.dirname(os.path.dirname(os.path.dirname(yaml_file))) + '/pefs' if use_pef_crs else None
+    prodtype = f"bundles-v2/{_pt}" if use_pef_crs else f"bundles/{_pt}"
     models = yaml_doc.get('spec', {}).get('models', {})
     pefs = yaml_doc.get('spec', {}).get('pefs', {})
-    
+
     for model_id in models:
         if not args.all_models_in_yaml and not re.search(f'{valid_models}', model_id, re.IGNORECASE): continue
         if not args.all_models_in_yaml and re.search(f'{ignore_names}', model_id): continue
@@ -245,8 +316,12 @@ def read_bundle_depoly_yaml(yaml_file, yaml_doc, results, PEF_ids):
             for config in experts[seq_size]['configs']:
                 pef_key = config['pef']
 
-                # Extract just the 'PEF_id' from the full path; record the batch_sizes being served by this pef_id
-                pef_id, ss, batch_sizes = resolve_inline_pef(pefs, pef_key, seq_size, config, yaml_file)
+                if use_pef_crs:
+                    # bundles-v2: pef field is "<cr-name>:<version>", resolve via PEF CR yaml
+                    pef_id, ss, batch_sizes = resolve_pef_cr(pef_dir, pef_key, seq_size, config, yaml_file)
+                else:
+                    # bundles-v1 style (inline pefs dict): pef field is a key into the pefs section
+                    pef_id, ss, batch_sizes = resolve_inline_pef(pefs, pef_key, seq_size, config, yaml_file)
                 if pef_id is None:
                     continue
                 PEF_ids[pef_id][model_id] = 1
@@ -268,7 +343,7 @@ def read_inference_depoly_yaml(yaml_file, yaml_doc, results, PEF_ids):
     # Extract models/experts section
     models = yaml_doc.get('spec', {}).get('experts', {})
     pefs = yaml_doc.get('spec', {}).get('pefs', {})
-    
+
     for model_string in models:
         if not args.all_models_in_yaml and not re.search(f'{valid_models}', model_string, re.IGNORECASE): continue
         if not args.all_models_in_yaml and re.search(f'{ignore_names}', model_string): continue
@@ -416,6 +491,10 @@ def print_results_yaml_summary(results, node_deploy_dict):
     for bundle_dir in set(list(node_deploy_dict['BUNDLE_DIR_PATH'].values())):
         all_bundle_files.extend(glob.glob(f"{bundle_dir}/sambastack/*.yaml"))
         all_bundle_files.extend(glob.glob(f"{bundle_dir}/prod/*.yaml"))
+        if args.v2:
+            bundle_dir_v1 = re.sub(r'/bundles-v2$', '/bundles', bundle_dir)
+            all_bundle_files.extend(glob.glob(f"{bundle_dir_v1}/sambastack/*.yaml"))
+            all_bundle_files.extend(glob.glob(f"{bundle_dir_v1}/prod/*.yaml"))
     for yaml_file in all_bundle_files:
         YAML = re.sub(r'\.yaml$', '', re.sub(r'.*/', '', yaml_file))
         if YAML in node_deploy_dict['YAML']:
@@ -565,7 +644,7 @@ def main():
     # Extract results
     node_deploy_dict = extract_deployment_names(tfvar_files)
     results, PEF_ids = extract_pef_mapping(node_deploy_dict)
-    
+
     # print results
     print_results_model_offering(results)
     print_results_PEF_summary(PEF_ids)
